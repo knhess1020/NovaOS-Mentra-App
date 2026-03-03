@@ -1,0 +1,19 @@
+{
+  "name": "novaos-mentra-app",
+  "version": "1.0.0",
+  "description": "Nova AI assistant for Mentra smart glasses",
+  "type": "module",
+  "scripts": {
+    "dev": "bun --hot src/index.ts",
+    "start": "bun src/index.ts"
+  },
+  "dependencies": {
+    "@mentra/sdk": "latest",
+    "openai": "latest",
+    "dotenv": "latest"
+  },
+  "devDependencies": {
+    "typescript": "^5.4.0",
+    "@types/node": "^20.0.0"
+  }
+}
