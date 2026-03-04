@@ -1,4 +1,5 @@
 import OpenAI from "openai";
+import type { ResponseCreateParamsNonStreaming } from "openai/resources/responses/responses.js";
 import type { NovaMode, Turn } from "./types.js";
 
 // ─── Client factory ───────────────────────────────────────────────────────────
@@ -120,19 +121,13 @@ export async function askNova({
   // SILENT mode: never call the API.
   if (mode === "SILENT") return "";
 
-  const resp = await (openai.responses as unknown as {
-    create(params: {
-      model: string;
-      reasoning: { effort: string };
-      instructions: string;
-      input: string;
-    }): Promise<{ output_text: string }>;
-  }).create({
+  const params: ResponseCreateParamsNonStreaming = {
     model: cfg.model,
     reasoning: { effort: "low" },
     instructions: buildNovaInstructions(mode),
     input: historyToInput(history, userText),
-  });
+  };
 
+  const resp = await openai.responses.create(params);
   return (resp.output_text ?? "").trim();
 }

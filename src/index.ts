@@ -1,5 +1,5 @@
 import "dotenv/config";
-import { AppServer, type Session } from "@mentra/sdk";
+import { AppServer, AppSession, type GlassesBatteryUpdate, type TranscriptionData } from "@mentra/sdk";
 import {
   createNovaClient,
   parseModeCommand,
@@ -56,7 +56,7 @@ function sleep(ms: number): Promise<void> {
 }
 
 async function show(
-  session: Session,
+  session: AppSession,
   text: string,
   durationMs: number
 ): Promise<void> {
@@ -78,24 +78,24 @@ function stripWakePrefix(text: string, wakeWord: string): string {
 
 class NovaMentraApp extends AppServer {
   protected override async onSession(
-    session: Session,
+    session: AppSession,
     _sessionId: string,
     _userId: string
   ): Promise<void> {
-    const sessionId = session.sessionId;
+    const sessionId = session.getSessionId();
 
     // Boot greeting
     await show(session, "NOVA online.", 2000);
 
     // Battery telemetry
-    session.events.onGlassesBattery((evt) => {
+    session.events.onGlassesBattery((evt: GlassesBatteryUpdate) => {
       console.log(`[${sessionId}] Battery: ${evt.level}%`);
     });
 
     // ── ONE transcription handler ─────────────────────────────────────────────
     let lastPartialUpdateAt = 0;
 
-    session.events.onTranscription(async (data) => {
+    session.events.onTranscription(async (data: TranscriptionData) => {
       const raw = data.text.trim();
       if (!raw) return;
 
@@ -165,10 +165,10 @@ class NovaMentraApp extends AppServer {
       }
     });
 
-    // Cleanup on session end
-    session.events.onSessionEnd?.(() => {
+    // Cleanup on session disconnect
+    session.events.onDisconnected(() => {
       clearSession(sessionId);
-      console.log(`[${sessionId}] Session ended.`);
+      console.log(`[${sessionId}] Session disconnected.`);
     });
   }
 }
