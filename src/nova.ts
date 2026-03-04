@@ -1,43 +1,61 @@
+// src/nova.ts
 import OpenAI from "openai";
-import type { ResponseCreateParamsNonStreaming } from "openai/resources/responses/responses.js";
 import type { NovaMode, Turn } from "./types.js";
 
-// ─── Client factory ───────────────────────────────────────────────────────────
+type NovaConfig = {
+  model: string;
+  wakeWord: string;
+};
 
 export function createNovaClient(apiKey: string): OpenAI {
   return new OpenAI({ apiKey });
 }
 
-// ─── Mode command parser ──────────────────────────────────────────────────────
+// ─── System instructions ──────────────────────────────────────────────────────
 
-const MODE_ALIASES: Record<string, NovaMode> = {
-  tactical: "TACTICAL",
-  build: "BUILD",
-  scan: "SCAN",
-  silent: "SILENT",
+const BASE_INSTRUCTIONS = `\
+You are Nova — a smart-glasses AI assistant.
+
+Style rules (non-negotiable):
+- Reply in 1–3 short lines maximum.
+- No explanations, no reasoning aloud, no "because" unless explicitly asked.
+- No filler phrases ("Sure!", "Of course", "Great question").
+- If the request is ambiguous, ask exactly ONE clarifying question and stop.
+- Use plain language. Abbreviate when safe.
+- Output ONLY the answer. No headings. No bullets unless the user asked for steps.
+`;
+
+const MODE_RULES: Record<NovaMode, string> = {
+  TACTICAL:
+    "Mode: TACTICAL. Single best next action. Imperative. Mission-critical.",
+  BUILD:
+    "Mode: BUILD. Technical, stepwise, but still short. Mention tools/settings when useful.",
+  SCAN:
+    "Mode: SCAN. Observe → hypothesize → propose ONE test. Objective, concise.",
+  SILENT:
+    "Mode: SILENT. Output nothing. (Caller should avoid API calls in SILENT.)",
 };
 
-/**
- * If the utterance is a mode-switch command ("mode scan", "mode build", …)
- * return the target NovaMode; otherwise return null.
- */
+export function buildNovaInstructions(mode: NovaMode): string {
+  return `${BASE_INSTRUCTIONS}\n${MODE_RULES[mode]}`;
+}
+
+// ─── Mode command parser ──────────────────────────────────────────────────────
+
 export function parseModeCommand(text: string): NovaMode | null {
   const lower = text.trim().toLowerCase();
-  const match = lower.match(/^mode\s+(\w+)$/);
-  if (!match) return null;
-  return MODE_ALIASES[match[1]!] ?? null;
+  const m = lower.match(/^mode\s+(tactical|build|scan|silent)\b/);
+  if (!m) return null;
+  const key = m[1];
+  if (key === "tactical") return "TACTICAL";
+  if (key === "build") return "BUILD";
+  if (key === "scan") return "SCAN";
+  if (key === "silent") return "SILENT";
+  return null;
 }
 
 // ─── Wake-word gating ─────────────────────────────────────────────────────────
 
-/**
- * Decide whether this utterance should trigger a Nova response.
- *
- * Fires when any of the following is true:
- *   1. `wakeArmed` is true (the previous turn was the wake word alone).
- *   2. The text starts with the wake word (optionally followed by punctuation).
- *   3. The text exactly equals the wake word (bare invocation).
- */
 export function shouldTriggerNova(
   userText: string,
   wakeWord: string,
@@ -45,89 +63,119 @@ export function shouldTriggerNova(
 ): boolean {
   if (wakeArmed) return true;
 
-  const lower = userText.trim().toLowerCase();
-  const wake = wakeWord.toLowerCase();
+  const t = userText.trim().toLowerCase();
+  const w = wakeWord.trim().toLowerCase();
+  if (!w) return true;
 
-  // Exact match (bare "nova")
-  if (lower === wake) return true;
-
-  // Starts with wake word followed by whitespace or punctuation
-  const prefixRe = new RegExp(`^${escapeRegex(wake)}[\\s,!?.]+`, "i");
-  return prefixRe.test(lower);
-}
-
-function escapeRegex(s: string): string {
-  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-}
-
-// ─── System instructions ──────────────────────────────────────────────────────
-
-const BASE_INSTRUCTIONS = `\
-You are Nova — a smart-glasses AI assistant.
-Style rules (non-negotiable):
-- Reply in 1–3 short lines maximum.
-- No explanations, no reasoning aloud, no "because" unless explicitly asked.
-- No filler phrases ("Sure!", "Of course", "Great question").
-- If the request is ambiguous, ask exactly ONE clarifying question and stop.
-- Use plain language. Abbreviate when safe.
-`;
-
-const MODE_RULES: Record<NovaMode, string> = {
-  TACTICAL: `Mode: TACTICAL. Prioritise speed and brevity. Use imperative tense. Think mission-critical.`,
-  BUILD: `Mode: BUILD. Favour technical precision. Mention relevant tools or patterns. Be constructive.`,
-  SCAN: `Mode: SCAN. Analytical tone. Surface key facts, anomalies, or risks. Be objective.`,
-  SILENT: `Mode: SILENT. Do not respond to any prompts. Output nothing.`,
-};
-
-export function buildNovaInstructions(mode: NovaMode): string {
-  return `${BASE_INSTRUCTIONS}\n${MODE_RULES[mode]}`;
+  if (t === w) return true;
+  return (
+    t.startsWith(`${w} `) ||
+    t.startsWith(`${w},`) ||
+    t.startsWith(`${w}:`) ||
+    t.startsWith(`${w}.`) ||
+    t.startsWith(`${w}!`) ||
+    t.startsWith(`${w}?`)
+  );
 }
 
 // ─── History formatting ───────────────────────────────────────────────────────
 
-/**
- * Build the input string from the last 8 turns plus the current user message.
- */
 export function historyToInput(history: Turn[], userText: string): string {
   const recent = history.slice(-8);
-  const lines = recent.map((t) =>
-    t.role === "user" ? `User: ${t.text}` : `Nova: ${t.text}`
-  );
-  lines.push(`User: ${userText}`);
-  return lines.join("\n");
+  const ctx = recent
+    .map((t) => `${t.role === "user" ? "User" : "Nova"}: ${t.text}`)
+    .join("\n");
+  return ctx ? `${ctx}\nUser: ${userText}` : userText;
 }
 
-// ─── Ask Nova ─────────────────────────────────────────────────────────────────
+// ─── Non-streaming call (fallback) ───────────────────────────────────────────
 
-interface AskNovaParams {
+export async function askNova(params: {
   openai: OpenAI;
-  cfg: { model: string; wakeWord: string };
+  cfg: NovaConfig;
   mode: NovaMode;
   history: Turn[];
   userText: string;
+  signal?: AbortSignal;
+}): Promise<string> {
+  const { openai, cfg, mode, history, userText, signal } = params;
+
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const resp = await (openai.responses as any).create(
+    {
+      model: cfg.model,
+      reasoning: { effort: "low" },
+      instructions: buildNovaInstructions(mode),
+      input: historyToInput(history, userText),
+    },
+    { signal }
+  );
+
+  return ((resp.output_text as string | undefined) ?? "").trim();
 }
 
+// ─── Streaming call ───────────────────────────────────────────────────────────
+
 /**
- * Call the OpenAI Responses API and return Nova's reply text.
- * Returns an empty string on any non-throwing edge case.
+ * Streams a Nova reply, calling `onDelta` with each incremental text chunk.
+ * Returns the full final text. Falls back to non-streaming if unavailable.
  */
-export async function askNova({
-  openai,
-  cfg,
-  mode,
-  history,
-  userText,
-}: AskNovaParams): Promise<string> {
-  // SILENT mode: never call the API.
-  if (mode === "SILENT") return "";
+export async function askNovaStream(params: {
+  openai: OpenAI;
+  cfg: NovaConfig;
+  mode: NovaMode;
+  history: Turn[];
+  userText: string;
+  onDelta: (deltaText: string) => void;
+  signal?: AbortSignal;
+}): Promise<string> {
+  const { openai, cfg, mode, history, userText, onDelta, signal } = params;
 
-  const params: ResponseCreateParamsNonStreaming = {
-    model: cfg.model,
-    reasoning: { effort: "low" },
-    instructions: buildNovaInstructions(mode),
-    input: historyToInput(history, userText),
-  };
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const responsesAny = openai.responses as any;
 
-  const resp = await openai.responses.create(params);
-  return (resp.output_text ?? "").trim();
+  // ── Path A: openai.responses.stream (preferred) ───────────────────────────
+  if (typeof responsesAny.stream === "function") {
+    const stream: AsyncIterable<unknown> = responsesAny.stream(
+      {
+        model: cfg.model,
+        reasoning: { effort: "low" },
+        instructions: buildNovaInstructions(mode),
+        input: historyToInput(history, userText),
+      },
+      { signal }
+    ) as AsyncIterable<unknown>;
+
+    let full = "";
+
+    for await (const event of stream) {
+      // Responses streaming event shapes:
+      //   { type: "response.output_text.delta", delta: "..." }
+      //   { type: "response.output_text.delta", delta: { text: "..." } }
+      const ev = event as Record<string, unknown>;
+      const type = typeof ev["type"] === "string" ? ev["type"] : "";
+
+      if (type.includes("output_text") && type.includes("delta")) {
+        const raw = ev["delta"];
+        const d =
+          typeof raw === "string"
+            ? raw
+            : typeof (raw as Record<string, unknown>)?.["text"] === "string"
+            ? ((raw as Record<string, unknown>)["text"] as string)
+            : typeof ev["text"] === "string"
+            ? (ev["text"] as string)
+            : "";
+
+        if (d) {
+          full += d;
+          onDelta(d);
+        }
+      }
+    }
+
+    return full.trim();
+  }
+
+  // ── Path B: fallback to non-streaming ─────────────────────────────────────
+  return await askNova({ openai, cfg, mode, history, userText, signal });
 }

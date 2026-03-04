@@ -1,4 +1,5 @@
 // ─── Types ────────────────────────────────────────────────────────────────────
+import { ViewType } from "@mentra/sdk";
 
 // Minimal structural interface matching @mentra/sdk LayoutManager.
 // showTextWall returns void (synchronous fire-and-forget in the SDK).
@@ -6,7 +7,7 @@ interface DisplaySession {
   layouts: {
     showTextWall(
       text: string,
-      opts?: { durationMs?: number }
+      opts?: { view?: ViewType; durationMs?: number }
     ): void;
   };
 }
@@ -66,7 +67,7 @@ const WS_NOT_READY = "WebSocket connection not established";
 export async function safeShowTextWall(
   session: DisplaySession,
   text: string,
-  opts: { durationMs?: number } = {},
+  opts: { view?: ViewType; durationMs?: number } = {},
   tries = 12,
   delayMs = 250
 ): Promise<void> {
