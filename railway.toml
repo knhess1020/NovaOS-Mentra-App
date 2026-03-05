@@ -1,0 +1,10 @@
+builder = "dockerfile"
+
+[deploy]
+restartPolicyType = "always"
+restartPolicyMaxRetries = 10
+healthcheckPath = "/health"
+healthcheckTimeout = 10
+
+[env]
+PORT = "3000"
