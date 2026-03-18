@@ -190,6 +190,70 @@ function isInterpretQuery(text: string): boolean {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Phone action intent helpers
+// ─────────────────────────────────────────────────────────────────────────────
+
+function isCallIntent(text: string): boolean {
+  const lower = text.trim().toLowerCase();
+  return /^(call|dial|phone)\s+\S/.test(lower);
+}
+
+function isTextIntent(text: string): boolean {
+  const lower = text.trim().toLowerCase();
+  return (
+    /^text\s+\S/.test(lower) ||
+    /^message\s+\S/.test(lower) ||
+    /^send\s+(a\s+|an\s+)?(message|text|msg)\s+(to\s+)?\S/.test(lower)
+  );
+}
+
+/** Strips the action verb prefix and returns everything after it as the target. */
+function parseCallTarget(text: string): string {
+  return text.trim().replace(/^(call|dial|phone)\s+/i, "").trim();
+}
+
+/** Returns the first word after "text"/"message", or the name after "send ... to". */
+function parseTextRecipient(text: string): string | null {
+  let m = text.match(/^(?:text|message)\s+(\S+)/i);
+  if (m) return m[1];
+  m = text.match(/^send\s+(?:a\s+|an\s+)?(?:message|text|msg)\s+to\s+(\S+)/i);
+  if (m) return m[1];
+  return null;
+}
+
+/** Returns everything after "text <recipient> " as the message body, or null. */
+function parseTextMessage(text: string, recipient: string): string | null {
+  const esc = recipient.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const m = text.match(new RegExp(`^(?:text|message)\\s+${esc}\\s+(.+)$`, "i"));
+  return m ? m[1].trim() : null;
+}
+
+/** Extracts the first US-style phone number found in a string. */
+function extractPhoneNumber(text: string): string | null {
+  const m = text.match(/\(?\d{3}\)?[\s.\-]?\d{3}[\s.\-]?\d{4}/);
+  return m ? m[0] : null;
+}
+
+function isConfirmation(text: string): boolean {
+  const lower = text.trim().toLowerCase().replace(/[.,!?]+$/, "");
+  const exact = [
+    "yes", "yeah", "yep", "yup", "sure", "ok", "okay", "confirm",
+    "go ahead", "do it", "send it", "call", "call them", "send",
+    "yes please", "sounds good", "let's do it", "lets do it",
+  ];
+  return exact.includes(lower) || lower.startsWith("yes ") || lower.startsWith("yeah ");
+}
+
+function isCancellation(text: string): boolean {
+  const lower = text.trim().toLowerCase().replace(/[.,!?]+$/, "");
+  const exact = [
+    "no", "nope", "cancel", "never mind", "nevermind",
+    "forget it", "don't", "dont", "abort", "stop it", "no thanks",
+  ];
+  return exact.includes(lower) || lower.startsWith("no ") || lower.startsWith("cancel ");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Voice profiles
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -391,6 +455,8 @@ type CueType =
   | "vision_scene"
   | "vision_ocr"
   | "vision_interpret"
+  | "call_lookup"
+  | "text_prepare"
   | "llm";
 
 /**
@@ -408,6 +474,8 @@ function getProgressCue(type: CueType): string {
     case "vision_scene":     return "Looking now.";
     case "vision_ocr":       return "Reading it.";
     case "vision_interpret": return "Analyzing that.";
+    case "call_lookup":      return "Looking up the number.";
+    case "text_prepare":     return "Preparing the message.";
     case "llm":              return "On it.";
   }
 }
@@ -458,7 +526,28 @@ type DeviceStatePayload = {
   ts: number;
 };
 
+// Phone action SSE payload — sent when Nova is ready to execute a confirmed action.
+type PhoneActionPayload = {
+  type: "phone-action";
+  action: "call" | "text";
+  label: string;
+  target?: string;
+  phoneNumber?: string;
+  recipient?: string;
+  message?: string;
+  ts: number;
+};
+
+// Per-session pending phone action state.
+type PendingAction =
+  | { kind: "call"; target: string; phoneNumber?: string }
+  | { kind: "text"; recipient: string; message: string }
+  | { kind: "text_compose"; recipient: string };
+
 const sseClientsByUser = new Map<string, Set<Response>>();
+
+// Keyed by sessionId — cleared on session end.
+const pendingActionBySession = new Map<string, PendingAction>();
 
 function writeSse(res: Response, event: PhoneEvent): void {
   res.write(`data: ${JSON.stringify(event)}\n\n`);
@@ -500,6 +589,20 @@ function broadcastDeviceState(userId: string, payload: DeviceStatePayload): void
   if (clients.size === 0) {
     sseClientsByUser.delete(userId);
   }
+}
+
+function broadcastPhoneAction(userId: string, payload: PhoneActionPayload): void {
+  const clients = sseClientsByUser.get(userId);
+  if (!clients || clients.size === 0) return;
+  const data = `data: ${JSON.stringify(payload)}\n\n`;
+  for (const res of clients) {
+    try {
+      res.write(data);
+    } catch {
+      clients.delete(res);
+    }
+  }
+  if (clients.size === 0) sseClientsByUser.delete(userId);
 }
 
 function addSseClient(userId: string, res: Response): void {
@@ -654,6 +757,24 @@ function renderWebviewHtml(userId: string): string {
     .telem-val.online  { color: #34d399; }
     .telem-val.offline { color: #f87171; }
     .telem-val.charging { color: #fbbf24; }
+    .card.action { background: #131d35; border-color: #2a4070; }
+    .action-detail { font-size: 13px; color: var(--muted); margin-bottom: 8px; }
+    .action-btns { display: flex; gap: 10px; margin-top: 10px; }
+    .action-btn {
+      display: inline-block;
+      padding: 9px 22px;
+      border-radius: 10px;
+      font-size: 14px;
+      font-weight: 600;
+      cursor: pointer;
+      text-decoration: none;
+      border: none;
+      font-family: inherit;
+      transition: background 0.15s;
+    }
+    .action-btn-primary { background: #2563eb; color: #fff; }
+    .action-btn-primary:hover { background: #1d4ed8; }
+    .action-btn[disabled], .action-btn.disabled { opacity: 0.4; pointer-events: none; }
   </style>
 </head>
 <body>
@@ -822,6 +943,64 @@ function renderWebviewHtml(userId: string): string {
       prepend(makeCard("assistant", "Nova", finalText, ts));
     }
 
+    function renderPhoneActionCard(data) {
+      const card = document.createElement("div");
+      card.className = "card action";
+
+      const meta = document.createElement("div");
+      meta.className = "meta";
+      meta.textContent = "Action Ready \u2022 " + time(data.ts);
+      card.appendChild(meta);
+
+      const labelEl = document.createElement("div");
+      labelEl.style.fontWeight = "600";
+      labelEl.style.marginBottom = "6px";
+      labelEl.textContent = data.label;
+      card.appendChild(labelEl);
+
+      if (data.phoneNumber) {
+        const numEl = document.createElement("div");
+        numEl.className = "action-detail";
+        numEl.textContent = data.phoneNumber;
+        card.appendChild(numEl);
+      }
+
+      if (data.message) {
+        const msgEl = document.createElement("div");
+        msgEl.className = "action-detail";
+        msgEl.textContent = "\u201c" + data.message + "\u201d";
+        card.appendChild(msgEl);
+      }
+
+      const btns = document.createElement("div");
+      btns.className = "action-btns";
+
+      if (data.action === "call") {
+        const btn = document.createElement("a");
+        if (data.phoneNumber) {
+          btn.href = "tel:" + data.phoneNumber.replace(/\\D/g, "");
+        } else {
+          btn.className += " disabled";
+        }
+        btn.className = "action-btn action-btn-primary" + (data.phoneNumber ? "" : " disabled");
+        btn.textContent = "Call";
+        btns.appendChild(btn);
+      } else if (data.action === "text") {
+        const digits = data.phoneNumber ? data.phoneNumber.replace(/\\D/g, "") : "";
+        const smsUri = digits
+          ? "sms:" + digits + (data.message ? "?body=" + encodeURIComponent(data.message) : "")
+          : "sms:?body=" + encodeURIComponent(data.message || "");
+        const btn = document.createElement("a");
+        btn.href = smsUri;
+        btn.className = "action-btn action-btn-primary";
+        btn.textContent = "Send";
+        btns.appendChild(btn);
+      }
+
+      card.appendChild(btns);
+      prepend(card);
+    }
+
     const params = new URLSearchParams(window.location.search);
     const token = params.get("aos_frontend_token");
     const streamUrl = token
@@ -845,6 +1024,11 @@ function renderWebviewHtml(userId: string): string {
 
       if (data.type === "device_state") {
         updateTelemetryPanel(data);
+        return;
+      }
+
+      if (data.type === "phone-action") {
+        renderPhoneActionCard(data);
         return;
       }
 
@@ -1153,6 +1337,108 @@ class NovaMentraApp extends AppServer {
       followupUntil = Date.now() + 8000;
       console.log("[Nova] Follow-up window set until:", followupUntil);
 
+      // ── Pending phone action: confirmation / compose / cancel ─────────────
+      const pendingAction = pendingActionBySession.get(sessionId);
+      if (pendingAction) {
+        // text_compose: user is now providing the message body
+        if (pendingAction.kind === "text_compose") {
+          if (isCancellation(userText)) {
+            pendingActionBySession.delete(sessionId);
+            const cancelReply = "Cancelled.";
+            pushTurn(sessionId, { role: "user", text: userText });
+            pushTurn(sessionId, { role: "assistant", text: cancelReply });
+            broadcastToUser(userId, phoneEvent("assistant-final", cancelReply));
+            try {
+              ignoreTranscriptsUntil = Date.now() + 4000;
+              await session.audio.speak(cancelReply, { model_id: CFG.ttsModel, voice_id: getVoiceId() });
+            } catch {}
+            return;
+          }
+          // Treat utterance as the message
+          const { recipient } = pendingAction;
+          const composedMessage = userText;
+          pendingActionBySession.set(sessionId, { kind: "text", recipient, message: composedMessage });
+          const confirmMsg = `Ready to send: ${composedMessage}`;
+          pushTurn(sessionId, { role: "user", text: userText });
+          pushTurn(sessionId, { role: "assistant", text: confirmMsg });
+          broadcastToUser(userId, phoneEvent("status", `Action pending: Text ${recipient}`));
+          broadcastToUser(userId, phoneEvent("assistant-final", confirmMsg));
+          try {
+            ignoreTranscriptsUntil = Date.now() + 4000;
+            const ttsResult = await session.audio.speak(clampTtsText(confirmMsg), {
+              model_id: CFG.ttsModel,
+              voice_id: getVoiceId(),
+            });
+            if (!ttsResult.success) {
+              broadcastToUser(userId, phoneEvent("error", `TTS failed: ${ttsResult.error ?? "unknown error"}`));
+            }
+          } catch (ttsErr) {
+            console.warn(`[${sessionId}] Text compose TTS failed:`, ttsErr);
+          }
+          return;
+        }
+
+        // call / text pending: check for confirmation or cancellation
+        if (isConfirmation(userText)) {
+          const execMsg =
+            pendingAction.kind === "call"
+              ? `Calling ${pendingAction.target}.`
+              : `Sending the message.`;
+          // Broadcast the actionable phone-action event to the phone UI
+          if (pendingAction.kind === "call") {
+            broadcastPhoneAction(userId, {
+              type: "phone-action",
+              action: "call",
+              label: `Call ${pendingAction.target}`,
+              target: pendingAction.target,
+              phoneNumber: pendingAction.phoneNumber,
+              ts: Date.now(),
+            });
+          } else {
+            broadcastPhoneAction(userId, {
+              type: "phone-action",
+              action: "text",
+              label: `Text ${pendingAction.recipient}`,
+              recipient: pendingAction.recipient,
+              message: pendingAction.message,
+              ts: Date.now(),
+            });
+          }
+          pendingActionBySession.delete(sessionId);
+          pushTurn(sessionId, { role: "user", text: userText });
+          pushTurn(sessionId, { role: "assistant", text: execMsg });
+          broadcastToUser(userId, phoneEvent("assistant-final", execMsg));
+          try {
+            ignoreTranscriptsUntil = Date.now() + 4000;
+            await session.audio.speak(clampTtsText(execMsg), {
+              model_id: CFG.ttsModel,
+              voice_id: getVoiceId(),
+            });
+          } catch {}
+          return;
+        }
+
+        if (isCancellation(userText)) {
+          pendingActionBySession.delete(sessionId);
+          const cancelReply = "Cancelled.";
+          pushTurn(sessionId, { role: "user", text: userText });
+          pushTurn(sessionId, { role: "assistant", text: cancelReply });
+          broadcastToUser(userId, phoneEvent("assistant-final", cancelReply));
+          try {
+            ignoreTranscriptsUntil = Date.now() + 4000;
+            await session.audio.speak(cancelReply, {
+              model_id: CFG.ttsModel,
+              voice_id: getVoiceId(),
+            });
+          } catch {}
+          return;
+        }
+
+        // Not a confirmation or cancellation — clear the stale pending action and fall through.
+        pendingActionBySession.delete(sessionId);
+      }
+      // ─────────────────────────────────────────────────────────────────────
+
       if (inFlight) {
         inFlight.abort();
         inFlight = null;
@@ -1381,6 +1667,135 @@ class NovaMentraApp extends AppServer {
           } catch (ttsErr) {
             console.warn(`[${sessionId}] Voice switch TTS failed:`, ttsErr);
           }
+        }
+        return;
+      }
+
+      // ── Call intent ───────────────────────────────────────────────────────
+      if (isCallIntent(userText)) {
+        console.log("[Nova] Call intent detected:", userText);
+        const callTarget = parseCallTarget(userText);
+
+        if (!callTarget) {
+          const reply = "Who would you like to call?";
+          pushTurn(sessionId, { role: "user", text: userText });
+          pushTurn(sessionId, { role: "assistant", text: reply });
+          broadcastToUser(userId, phoneEvent("assistant-final", reply));
+          try {
+            ignoreTranscriptsUntil = Date.now() + 4000;
+            await session.audio.speak(reply, { model_id: CFG.ttsModel, voice_id: getVoiceId() });
+          } catch {}
+          return;
+        }
+
+        const callCue = getProgressCue("call_lookup");
+        broadcastToUser(userId, phoneEvent("status", callCue));
+        await speakCue(callCue);
+
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const callSessionAny = session as any;
+        const callTimezone: string | undefined =
+          callSessionAny.settings?.mentraosSettings?.userTimezone ??
+          callSessionAny.mentraosSettings?.userTimezone ??
+          undefined;
+
+        let callPhoneNumber: string | undefined;
+        try {
+          const callLookup = await doLiveLookup({
+            userText: `phone number for ${callTarget}`,
+            timezone: callTimezone,
+          });
+          const extracted = extractPhoneNumber(callLookup.answer);
+          if (extracted) callPhoneNumber = extracted;
+          console.log("[Nova] Call lookup result:", callLookup.answer, "| number:", callPhoneNumber ?? "(none)");
+        } catch (lookupErr) {
+          console.warn(`[${sessionId}] Call number lookup failed:`, lookupErr);
+        }
+
+        pendingActionBySession.set(sessionId, { kind: "call", target: callTarget, phoneNumber: callPhoneNumber });
+
+        const callConfirmMsg = callPhoneNumber
+          ? `I found a number for ${callTarget}. Ready to call?`
+          : `I couldn't find a number for ${callTarget}. Still want to try calling?`;
+
+        pushTurn(sessionId, { role: "user", text: userText });
+        pushTurn(sessionId, { role: "assistant", text: callConfirmMsg });
+        broadcastToUser(userId, phoneEvent("status", `Action pending: Call ${callTarget}`));
+        broadcastToUser(userId, phoneEvent("assistant-final", callConfirmMsg));
+
+        try {
+          ignoreTranscriptsUntil = Date.now() + 4000;
+          const ttsResult = await session.audio.speak(clampTtsText(callConfirmMsg), {
+            model_id: CFG.ttsModel,
+            voice_id: getVoiceId(),
+          });
+          if (!ttsResult.success) {
+            broadcastToUser(userId, phoneEvent("error", `TTS failed: ${ttsResult.error ?? "unknown error"}`));
+          }
+        } catch (ttsErr) {
+          console.warn(`[${sessionId}] Call intent TTS failed:`, ttsErr);
+        }
+        return;
+      }
+
+      // ── Text intent ───────────────────────────────────────────────────────
+      if (isTextIntent(userText)) {
+        console.log("[Nova] Text intent detected:", userText);
+        const textRecipient = parseTextRecipient(userText);
+
+        if (!textRecipient) {
+          const reply = "Who would you like to text?";
+          pushTurn(sessionId, { role: "user", text: userText });
+          pushTurn(sessionId, { role: "assistant", text: reply });
+          broadcastToUser(userId, phoneEvent("assistant-final", reply));
+          try {
+            ignoreTranscriptsUntil = Date.now() + 4000;
+            await session.audio.speak(reply, { model_id: CFG.ttsModel, voice_id: getVoiceId() });
+          } catch {}
+          return;
+        }
+
+        const textMessage = parseTextMessage(userText, textRecipient);
+
+        if (!textMessage) {
+          // Ask user to provide the message body
+          pendingActionBySession.set(sessionId, { kind: "text_compose", recipient: textRecipient });
+          const reply = `What would you like to say to ${textRecipient}?`;
+          pushTurn(sessionId, { role: "user", text: userText });
+          pushTurn(sessionId, { role: "assistant", text: reply });
+          broadcastToUser(userId, phoneEvent("assistant-final", reply));
+          try {
+            ignoreTranscriptsUntil = Date.now() + 4000;
+            await session.audio.speak(clampTtsText(reply), { model_id: CFG.ttsModel, voice_id: getVoiceId() });
+          } catch (ttsErr) {
+            console.warn(`[${sessionId}] Text compose TTS failed:`, ttsErr);
+          }
+          return;
+        }
+
+        const textCue = getProgressCue("text_prepare");
+        broadcastToUser(userId, phoneEvent("status", textCue));
+        await speakCue(textCue);
+
+        pendingActionBySession.set(sessionId, { kind: "text", recipient: textRecipient, message: textMessage });
+
+        const textConfirmMsg = `Ready to send: ${textMessage}`;
+        pushTurn(sessionId, { role: "user", text: userText });
+        pushTurn(sessionId, { role: "assistant", text: textConfirmMsg });
+        broadcastToUser(userId, phoneEvent("status", `Action pending: Text ${textRecipient}`));
+        broadcastToUser(userId, phoneEvent("assistant-final", textConfirmMsg));
+
+        try {
+          ignoreTranscriptsUntil = Date.now() + 4000;
+          const ttsResult = await session.audio.speak(clampTtsText(textConfirmMsg), {
+            model_id: CFG.ttsModel,
+            voice_id: getVoiceId(),
+          });
+          if (!ttsResult.success) {
+            broadcastToUser(userId, phoneEvent("error", `TTS failed: ${ttsResult.error ?? "unknown error"}`));
+          }
+        } catch (ttsErr) {
+          console.warn(`[${sessionId}] Text intent TTS failed:`, ttsErr);
         }
         return;
       }
@@ -1698,6 +2113,7 @@ class NovaMentraApp extends AppServer {
     session.events.onSessionEnd?.(() => {
       clearInterval(wakeTicker);
       if (inFlight) inFlight.abort();
+      pendingActionBySession.delete(sessionId);
       clearSession(sessionId);
 
       console.log(`[${sessionId}] Session ended.`);

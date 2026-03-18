@@ -14,3 +14,9 @@ export interface Turn {
   role: "user" | "assistant";
   text: string;
 }
+
+// ─── Phone Actions ────────────────────────────────────────────────────────────
+
+export type PhoneAction =
+  | { type: "call"; target: string; phoneNumber?: string }
+  | { type: "text"; recipient: string; message?: string };
